@@ -98,20 +98,39 @@ function Invoke-Pipeline {
     & $log ("Начало бэкапа")
     & $log ("База: {0}" -f $tag)
 
-    $configFile   = Join-Path $Ctx.ConfigDir  ("{0}.json" -f $tag)
-    $configRoot   = $Ctx.ConfigRoot
-    $keyPath      = Join-Path $configRoot 'key.bin'
-    $secretsPath  = Join-Path $configRoot 'secrets.json.enc'
+    $configRoot = $null
+    if ($Ctx.ContainsKey('ConfigRoot') -and $Ctx['ConfigRoot']) {
+        $configRoot = [string]$Ctx['ConfigRoot']
+    } else {
+        $baseRoot = if ($PSScriptRoot) { $PSScriptRoot } elseif ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path } else { (Get-Location).Path }
+        if ($baseRoot) { $configRoot = Join-Path -Path $baseRoot -ChildPath '..\config' }
+    }
 
-    if (!(Test-Path $configFile)) { throw "Конфиг базы '$tag' не найден: $configFile" }
+    $configDir = $null
+    if ($Ctx.ContainsKey('ConfigDir') -and $Ctx['ConfigDir']) {
+        $configDir = [string]$Ctx['ConfigDir']
+    } elseif ($configRoot) {
+        $configDir = Join-Path -Path $configRoot -ChildPath 'bases'
+    }
+
+    $configFile  = if ($configDir) { Join-Path -Path $configDir -ChildPath ("{0}.json" -f $tag) } else { $null }
+    $keyPath     = if ($configRoot) { Join-Path -Path $configRoot -ChildPath 'key.bin' } else { $null }
+    $secretsPath = if ($configRoot) { Join-Path -Path $configRoot -ChildPath 'secrets.json.enc' } else { $null }
+
+    if (-not $configFile -or -not (Test-Path -LiteralPath $configFile)) { throw "Конфиг базы '$tag' не найден: $configFile" }
 
     $config  = ConvertTo-Hashtable (Get-Content $configFile -Raw | ConvertFrom-Json)
-	# >>> пропуск отключенных баз
-if ($config.ContainsKey('Disabled') -and $config['Disabled']) {
-    & $log ("База [{0}] отключена (Disabled=true) — пропуск." -f $tag)
-    return $null
+    # >>> пропуск отключенных баз
+    if ($config.ContainsKey('Disabled') -and $config['Disabled']) {
+        & $log ("База [{0}] отключена (Disabled=true) — пропуск." -f $tag)
+        return $null
+    }
+
     $secrets = @{}
-    if (Test-Path $secretsPath) {
+    if ($Ctx.ContainsKey('Secrets') -and $Ctx['Secrets']) {
+        $secrets = ConvertTo-Hashtable $Ctx['Secrets']
+    }
+    elseif ($secretsPath -and (Test-Path -LiteralPath $secretsPath) -and $keyPath -and (Test-Path -LiteralPath $keyPath)) {
         try { $secrets = ConvertTo-Hashtable (Decrypt-Secrets -InFile $secretsPath -KeyPath $keyPath) } catch { $secrets = @{} }
     }
 
@@ -121,11 +140,13 @@ if ($config.ContainsKey('Disabled') -and $config['Disabled']) {
     $exeCfg     = $config['ExePath']
     $keep       = 0 + ($config['Keep'])
     $useCloud   = ("" + $config['CloudType']) -eq 'Yandex.Disk'
+    $cloudCleanup = $false
+    if ($config.ContainsKey('CloudCleanup')) { $cloudCleanup = [bool]$config['CloudCleanup'] }
     $dumpTimeoutMin = [int]$config['DumpTimeoutMin']; if ($dumpTimeoutMin -le 0) { $dumpTimeoutMin = 60 }
 
     if ([string]::IsNullOrWhiteSpace($src))    { throw "Не задан SourcePath в конфиге" }
     if ([string]::IsNullOrWhiteSpace($dstDir)) { throw "Не задан DestinationPath в конфиге" }
-    if (-not (Test-Path $dstDir)) { New-Item -ItemType Directory -Path $dstDir -Force | Out-Null }
+    if (-not (Test-Path -LiteralPath $dstDir)) { New-Item -ItemType Directory -Path $dstDir -Force | Out-Null }
 
     $ts  = Get-Date -Format 'yyyy_MM_dd_HHmm'
     $ext = if ($type -eq 'DT') { 'dt' } else { '1CD' }
@@ -162,6 +183,17 @@ if ($config.ContainsKey('Disabled') -and $config['Disabled']) {
             $passKey  = "{0}__DT_Password" -f $tag
             $login    = if ($secrets.ContainsKey($loginKey)) { [string]$secrets[$loginKey] } else { $null }
             $password = if ($secrets.ContainsKey($passKey))  { [string]$secrets[$passKey] }  else { $null }
+
+            if ($login) {
+                & $log "Логин 1С получен из секретов."
+            } else {
+                & $log "Логин 1С в секретах не найден — запуск без указания пользователя."
+            }
+            if ($password) {
+                & $log "Пароль 1С найден в секретах."
+            } else {
+                & $log "Пароль 1С в секретах отсутствует."
+            }
 
             $srcFolder = (Resolve-Path -LiteralPath $src).Path
             $srcFolder = $srcFolder.TrimEnd('\','/')
@@ -217,6 +249,16 @@ if ($config.ContainsKey('Disabled') -and $config['Disabled']) {
                 & $log ("Выгрузка в облако Я.Диск")
                 Upload-ToYandexDisk -Token $token -LocalPath $artifact -RemotePath "$remoteFolder/$remoteName" -BarWidth 28
                 & $log ("Выгрузка в облако Я.Диск завершена")
+                if ($cloudCleanup -and $keep -gt 0 -and (Get-Command Cleanup-YandexDiskFolder -ErrorAction SilentlyContinue)) {
+                    try {
+                        $deletedRemote = Cleanup-YandexDiskFolder -Token $token -RemoteFolder $remoteFolder -Keep $keep
+                        foreach ($name in $deletedRemote) {
+                            & $log ("Удалён старый облачный бэкап: {0}" -f $name)
+                        }
+                    } catch {
+                        & $log ("Не удалось очистить облако Я.Диск: {0}" -f $_.Exception.Message)
+                    }
+                }
             } else {
                 & $log ("ВНИМАНИЕ: включено облако, но токен для [{0}] не найден" -f $tag)
             }

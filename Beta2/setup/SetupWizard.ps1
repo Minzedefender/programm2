@@ -1,6 +1,21 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 Add-Type -AssemblyName System.Windows.Forms
-Import-Module -Force -DisableNameChecking (Join-Path $PSScriptRoot '..\modules\Common.Crypto.psm1')
+
+function Get-ScriptRoot {
+    if ($PSScriptRoot) { return $PSScriptRoot }
+    if ($MyInvocation.MyCommand.Path) { return Split-Path -Parent $MyInvocation.MyCommand.Path }
+    return (Get-Location).Path
+}
+
+$scriptRoot = Get-ScriptRoot
+
+$cryptoPath = Join-Path -Path $scriptRoot -ChildPath '..\modules\Common.Crypto.psm1'
+Import-Module -Force -DisableNameChecking $cryptoPath
+
+$telegramModule = Join-Path -Path $scriptRoot -ChildPath '..\modules\Common.Telegram.psm1'
+if ($telegramModule -and (Test-Path -LiteralPath $telegramModule)) {
+    try { Import-Module -Force -DisableNameChecking $telegramModule -ErrorAction Stop } catch { Write-Warning "Не удалось загрузить модуль Telegram: $($_.Exception.Message)" }
+}
 
 # ---------- helpers ----------
 function Select-FolderDialog($description) {
@@ -13,7 +28,7 @@ function Select-FileDialog($filter, $title, $initialDir = $null) {
     $dlg = New-Object System.Windows.Forms.OpenFileDialog
     $dlg.Filter = $filter
     $dlg.Title  = $title
-    if ($initialDir -and (Test-Path $initialDir)) { $dlg.InitialDirectory = $initialDir }
+    if ($initialDir -and (Test-Path -LiteralPath $initialDir)) { $dlg.InitialDirectory = $initialDir }
     if ($dlg.ShowDialog() -eq 'OK') { return $dlg.FileName } else { throw 'Отменено' }
 }
 function Read-Choice($prompt, $choices) {
@@ -53,7 +68,7 @@ function Get-1CEStartCandidates {
     $pf86 = ${env:ProgramFiles(x86)}
     if ($pf)   { $list += (Join-Path $pf   '1cv8\common\1cestart.exe') }
     if ($pf86) { $list += (Join-Path $pf86 '1cv8\common\1cestart.exe') }
-    $list | Where-Object { $_ -and (Test-Path $_) }
+    $list | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
 }
 function Select-1CEStart {
     $cands = Get-1CEStartCandidates
@@ -62,24 +77,36 @@ function Select-1CEStart {
 }
 
 # ---------- paths ----------
-$configRoot   = Join-Path $PSScriptRoot '..\config'
-$basesDir     = Join-Path $configRoot  'bases'
-$settingsFile = Join-Path $configRoot  'settings.json'
-$keyPath      = Join-Path $configRoot  'key.bin'
-$secretsFile  = Join-Path $configRoot  'secrets.json.enc'
+$configRoot   = if ($scriptRoot) { Join-Path -Path $scriptRoot -ChildPath '..\config' } else { $null }
+$basesDir     = if ($configRoot) { Join-Path -Path $configRoot  -ChildPath 'bases' } else { $null }
+$settingsFile = if ($configRoot) { Join-Path -Path $configRoot  -ChildPath 'settings.json' } else { $null }
+$keyPath      = if ($configRoot) { Join-Path -Path $configRoot  -ChildPath 'key.bin' } else { $null }
+$secretsFile  = if ($configRoot) { Join-Path -Path $configRoot  -ChildPath 'secrets.json.enc' } else { $null }
 
-if (-not (Test-Path $configRoot)) { New-Item -ItemType Directory -Path $configRoot | Out-Null }
-if (-not (Test-Path $basesDir  )) { New-Item -ItemType Directory -Path $basesDir   | Out-Null }
+if ($configRoot -and -not (Test-Path -LiteralPath $configRoot)) { New-Item -ItemType Directory -Path $configRoot | Out-Null }
+if ($basesDir   -and -not (Test-Path -LiteralPath $basesDir  )) { New-Item -ItemType Directory -Path $basesDir   | Out-Null }
 
 # ---------- load & merge secrets ----------
 [hashtable]$allSecrets = @{}
-if ((Test-Path $secretsFile) -and (Test-Path $keyPath)) {
+if ($secretsFile -and $keyPath -and (Test-Path -LiteralPath $secretsFile) -and (Test-Path -LiteralPath $keyPath)) {
     try {
         $raw = Decrypt-Secrets -InFile $secretsFile -KeyPath $keyPath
         $allSecrets = ConvertTo-Hashtable $raw
         if (-not ($allSecrets -is [hashtable])) { $allSecrets = @{} }
     } catch { $allSecrets = @{} }
 }
+
+# ---------- load settings ----------
+$settings = @{}
+if ($settingsFile -and (Test-Path -LiteralPath $settingsFile)) {
+    try { $settings = ConvertTo-Hashtable (Get-Content $settingsFile -Raw | ConvertFrom-Json) } catch { $settings = @{} }
+}
+$afterCurrent = if ($settings.ContainsKey('AfterBackup')) { [int]$settings['AfterBackup'] } else { 3 }
+$telegramSettings = if ($settings.ContainsKey('Telegram')) { ConvertTo-Hashtable $settings['Telegram'] } else { @{} }
+$telegramEnabledCurrent = [bool]($telegramSettings['Enabled'])
+$telegramChatIdCurrent  = if ($telegramSettings.ContainsKey('ChatId')) { '' + $telegramSettings['ChatId'] } else { '' }
+$telegramTokenKey = '__GLOBAL__TelegramBotToken'
+$telegramTokenCurrent = if ($allSecrets.ContainsKey($telegramTokenKey)) { '' + $allSecrets[$telegramTokenKey] } else { '' }
 
 $allConfigs = @()
 
@@ -168,13 +195,58 @@ while ($true) {
         $cfg.CloudType = 'Yandex.Disk'
         $token = Read-Host "Введите OAuth токен Яндекс.Диска"
         if ($token) { $allSecrets["$($cfg.Tag)__YADiskToken"] = $token }
+        $cleanCloud = Read-Choice "Очищать старые копии в Яндекс.Диске? (будет храниться столько же, сколько локально)" @('Да','Нет')
+        $cfg.CloudCleanup = ($cleanCloud -eq 1)
     } else {
         $cfg.CloudType = ''
+        $cfg.CloudCleanup = $false
     }
 
     $allConfigs += $cfg
     $more = Read-Choice "Добавить ещё одну базу?" @('Да','Нет')
     if ($more -ne 1) { break }
+}
+
+# ---------- общие настройки ----------
+$afterDescriptions = @('Выключить ПК','Перезагрузить ПК','Ничего не делать')
+$afterIdx = switch ($afterCurrent) { 1 { 1 } 2 { 2 } default { 3 } }
+Write-Host ("Текущее действие после бэкапа: {0}" -f $afterDescriptions[$afterIdx-1]) -ForegroundColor Cyan
+$act = Read-Choice "Что делать после завершения бэкапа?" $afterDescriptions
+
+$telegramEnabledNew = $telegramEnabledCurrent
+$telegramChatIdNew  = $telegramChatIdCurrent
+$telegramTokenNew   = $telegramTokenCurrent
+$tgStatus = if ($telegramEnabledCurrent) { 'включено' } else { 'отключено' }
+Write-Host ("Поддержка Telegram сейчас: $tgStatus") -ForegroundColor Cyan
+$tgChoice = Read-Choice "Отправлять логи в Telegram?" @('Да','Нет')
+if ($tgChoice -eq 1) {
+    $telegramEnabledNew = $true
+    $chatPrompt = Read-Host ("Chat ID получателя (текущее: {0})" -f (if ($telegramChatIdNew) { $telegramChatIdNew } else { '<пусто>' }))
+    if ($chatPrompt -ne '') { $telegramChatIdNew = $chatPrompt }
+    $tokenPrompt = Read-Host "Токен бота (оставьте пустым, чтобы не менять)"
+    if ($tokenPrompt -ne '') {
+        $telegramTokenNew = $tokenPrompt
+        $allSecrets[$telegramTokenKey] = $tokenPrompt
+    } elseif ($telegramTokenNew) {
+        $allSecrets[$telegramTokenKey] = $telegramTokenNew
+    }
+
+    if ($telegramChatIdNew -and $telegramTokenNew) {
+        if (Get-Command Send-TelegramMessage -ErrorAction SilentlyContinue) {
+            try {
+                Send-TelegramMessage -Token $telegramTokenNew -ChatId $telegramChatIdNew -Text "[TEST] Проверка подключения резервного копирования 1С" -DisableNotification | Out-Null
+                Write-Host "[INFO] Тестовое сообщение отправлено в Telegram." -ForegroundColor Green
+            } catch {
+                Write-Host ("[WARN] Не удалось отправить тестовое сообщение: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+            }
+        } else {
+            Write-Host "[WARN] Модуль Send-TelegramMessage недоступен, тест не выполнен." -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "[WARN] Chat ID или токен не заданы — тест не выполнен." -ForegroundColor Yellow
+    }
+} else {
+    $telegramEnabledNew = $false
 }
 
 # ---------- save ----------
@@ -184,10 +256,24 @@ foreach ($cfg in $allConfigs) {
     Write-Host ("Готово. База [{0}] добавлена." -f $cfg.Tag) -ForegroundColor Green
 }
 
-Encrypt-Secrets -Secrets $allSecrets -KeyPath $keyPath -OutFile $secretsFile
-Write-Host "Секреты сохранены и зашифрованы." -ForegroundColor Green
+if ($keyPath -and $secretsFile) {
+    Encrypt-Secrets -Secrets $allSecrets -KeyPath $keyPath -OutFile $secretsFile
+    Write-Host "Секреты сохранены и зашифрованы." -ForegroundColor Green
+} else {
+    Write-Host "[WARN] Не удалось сохранить секреты: не определены пути key/secrets." -ForegroundColor Yellow
+}
 
-$act = Read-Choice "Что делать после завершения бэкапа?" @('Выключить ПК','Перезагрузить ПК','Ничего не делать')
-@{ AfterBackup = $act } | ConvertTo-Json -Depth 2 | Set-Content -Path $settingsFile -Encoding UTF8
+$settingsOut = [ordered]@{
+    AfterBackup = $act
+    Telegram    = [ordered]@{
+        Enabled = [bool]$telegramEnabledNew
+        ChatId  = $telegramChatIdNew
+    }
+}
+if ($settingsFile) {
+    $settingsOut | ConvertTo-Json -Depth 4 | Set-Content -Path $settingsFile -Encoding UTF8
+} else {
+    Write-Host "[WARN] Не удалось сохранить настройки: неизвестен путь settings.json." -ForegroundColor Yellow
+}
 
 Write-Host "[INFO] Настройка баз завершена." -ForegroundColor Green
